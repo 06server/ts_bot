@@ -1,18 +1,21 @@
 import os
+import findspark
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+
+from pyspark.sql.functions import col,from_json
+from pyspark.sql import SparkSession
+
 
 os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-streaming-kafka-0-10_2.12:3.5.1,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 pyspark-shell'
-
-import findspark
 findspark.init('C:\Spark\spark-3.5.1-bin-hadoop3')
-
-from pyspark.sql import SparkSession
 
 spark = (SparkSession
         .builder
         .appName("consumer_structured_streaming_ex_1_1")
         .getOrCreate())
 
-adViewsDF = spark \
+df = spark \
             .readStream \
             .format("kafka") \
             .option("kafka.bootstrap.servers", "localhost:9092") \
@@ -21,7 +24,50 @@ adViewsDF = spark \
             .load() \
             .selectExpr("CAST(value AS STRING)") 
 
-query = adViewsDF.writeStream.format("console") \
+main_schema = T.StructType(
+  [
+    T.StructField('schema', T.StringType(), True),
+    T.StructField('payload', T.StringType(), True)
+  ]
+)
+
+payload_schema = T.StructType(
+  [
+    T.StructField('before', T.StringType(), True),
+    T.StructField('after', T.StringType(), True)
+  ]
+)
+
+table_schema = T.StructType(
+  [
+    T.StructField('id', T.StringType(), True),
+    T.StructField('phone', T.StringType(), True),
+    T.StructField('city', T.StringType(), True),
+    T.StructField('address', T.StringType(), True),
+    T.StructField('problem', T.StringType(), True)
+  ]
+)
+
+payload_df = df.withColumn("data", from_json(col("value"), main_schema)) \
+                          .select("data.payload")
+
+print("\n" + "-"*10 + "SCHEMA" + "-"*10 + "\n")
+payload_df.printSchema()
+
+after_df = payload_df.withColumn("data", from_json(col("payload"), payload_schema)) \
+                          .select("data.after")
+
+print("\n" + "-"*10 + "SCHEMA" + "-"*10 + "\n")
+after_df.printSchema()
+
+table_df = after_df.withColumn("data", from_json(col("after"), table_schema)) \
+                          .select(["data.id", "data.phone", "data.city", "data.address", "data.problem"]) \
+                          .dropna(how='any')
+
+print("\n" + "-"*10 + "SCHEMA" + "-"*10 + "\n")
+table_df.printSchema()
+
+query = table_df.writeStream.format("console") \
             .option("truncate", "false") \
             .outputMode("append") \
             .start() \
@@ -29,6 +75,8 @@ query = adViewsDF.writeStream.format("console") \
 
 
 """
+
+
 from pyspark.sql import SparkSession
 
 spark = SparkSession.builder.appName('Test').getOrCreate()
