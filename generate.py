@@ -30,7 +30,7 @@ def set_sql():
 with conn:
     with conn.cursor() as cursor:
         try:
-            for count in range(10):
+            for count in range(1):
                 cursor.execute(set_sql())
         except (Exception, psycopg2.DatabaseError) as error:
             print(error)
