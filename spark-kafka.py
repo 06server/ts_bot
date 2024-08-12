@@ -1,142 +1,81 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
-
 import os
-import tempfile
-import time
 import findspark
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+import values_for_df as v
 
-findspark.init('C:\Spark\spark-3.5.1-bin-hadoop3')
+from clickhouse_driver import Client
+from pyspark.sql.functions import col,from_json
+from pyspark.sql import SparkSession
 
 os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-streaming-kafka-0-10_2.12:3.5.1,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 pyspark-shell'
+findspark.init('C:\Spark\spark-3.5.1-bin-hadoop3')
 
-spark = (
-    SparkSession
+def show_schema(showing_df):
+    print("\n" + "-"*10 + "SCHEMA" + "-"*10 + "\n")
+    showing_df.printSchema()
+    
+client = Client(host='localhost', port=9000, user='default', password='password', database='default', settings={"use_numpy":True})
+
+spark = (SparkSession
     .builder
-    .appName("Streaming from kafka")
-    .config("spark.streaming.stopGracefullyOnShutdown", True)
-    .config('spark.jars.packages', 'org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1')
-    .config("spark.sql.shuffle.partitions", 4)
-    .master("local[*]")
-    .getOrCreate()
-)
+    .appName("consumer_structured_streaming_ex_1_1")
+    .getOrCreate())
 
-spark.sparkContext.setLogLevel("ERROR")
-
-df = (
-    spark
+df = spark \
     .readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9101") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
     .option("subscribe", "cdc.public.orders") \
     .option("startingOffsets", "earliest") \
     .load() \
     .selectExpr("CAST(value AS STRING)") 
-)
 
-df.printSchema()
+payload_df = df.withColumn("data", from_json(col("value"), v.main_schema)).select("data.payload")
+# show_schema(payload_df)
 
-query = df.writeStream.format("console") \
-            .option("truncate", "false") \
-            .outputMode("append") \
-            .start() \
-            .awaitTermination()
+after_df = payload_df.withColumn("data", from_json(col("payload"), v.payload_schema)).select("data.after")
+# show_schema(after_df)
 
-orders_schema = StructType() \
-        .add("order_id", StringType()) \
-        .add("order_phone", StringType()) \
-        .add("order_city", StringType()) \
-        .add("order_address", StringType()) \
-        .add("order_problem", StringType()) \
-        .add("order_description", StringType()) \
-        .add("order_all_section_time", StringType())
+def process_batch(batch_df, batch_id):
+    citys_df = batch_df.withColumn("data", from_json(col("after"), v.citys_schema)) \
+                          .select(v.columns_citys_df) \
+                          .dropna(how='any')
+    # show_schema(citys_df)
+    citys_df.show()
+    
+    address_df = batch_df.withColumn("data", from_json(col("after"), v.address_schema)) \
+                              .select(v.columns_address_df) \
+                              .dropna(how='any')
+    # show_schema(address_df)
+    address_df.show()
 
+    timing_df = batch_df.withColumn("data", from_json(col("after"), v.timing_schema)) \
+                              .select(v.columns_timing_df) \
+                              .dropna(how='any')
+    # show_schema(timing_df)
+    timing_df.show()
 
+    full_df = batch_df.withColumn("data", from_json(col("after"), v.full_schema)) \
+                              .select(v.columns_full_df) \
+                              .dropna(how='any')
+    # show_schema(full_df)
+    full_df.show()
 
-print("Stream Data Processing Application Completed.")
+    pd_citys_df = citys_df.toPandas()
+    pd_address_df = address_df.toPandas()
+    pd_timing_df = timing_df.toPandas()
+    pd_full_df = full_df.toPandas()
 
-"""
-transaction_detail_df1 = df.selectExpr("CAST(value AS STRING)", "timestamp")
+    client.insert_dataframe('INSERT INTO citys (city) VALUES', pd_citys_df)
+    client.insert_dataframe('INSERT INTO default.address (address) VALUES', pd_address_df)
+    client.insert_dataframe('INSERT INTO timings (main_section_time, equip_section_time, cabel_section_time, router_section_time, internet_section_time, lan_section_time, speed_section_time, wifi_section_time, connection_section_time, tariff_section_time, offs_section_time, errors_section_time, my_tariff_section_time, change_tariff_section_time, all_section_time) VALUES', pd_timing_df)
+    client.insert_dataframe('INSERT INTO full_data (city, address, main_section_time, equip_section_time, cabel_section_time, router_section_time, internet_section_time, lan_section_time, speed_section_time, wifi_section_time, connection_section_time, tariff_section_time, offs_section_time, errors_section_time, my_tariff_section_time, change_tariff_section_time, all_section_time) VALUES', pd_full_df)
 
-# Define a schema for the transaction_detail data
-transaction_detail_schema = StructType() \
-        .add("transaction_id", StringType()) \
-        .add("transaction_card_type", StringType()) \
-        .add("transaction_amount", StringType()) \
-        .add("transaction_datetime", StringType())
+    print("\n\n\n" + "-"*10 + "DATA IN TABLES" + "-"*10 + "\n\n\n")
+    
+query = after_df.writeStream \
+    .foreachBatch(process_batch) \
+    .start()
 
-transaction_detail_df2 = transaction_detail_df1\
-        .select(from_json(col("value"), transaction_detail_schema).alias("transaction_detail"), "timestamp")
-
-transaction_detail_df3 = transaction_detail_df2.select("transaction_detail.*", "timestamp")
-
-# Simple aggregate - find total_transaction_amount by grouping transaction_card_type
-transaction_detail_df4 = transaction_detail_df3.groupBy("transaction_card_type")\
-        .agg({'transaction_amount': 'sum'}).select("transaction_card_type", \
-        col("sum(transaction_amount)").alias("total_transaction_amount"))
-
-print("Printing Schema of transaction_detail_df4: ")
-transaction_detail_df4.printSchema()
-
-
-transaction_detail_df5 = transaction_detail_df4.withColumn("key", lit(100))\
-                                                    .withColumn("value", concat(lit("{'transaction_card_type': '"), \
-                                                    col("transaction_card_type"), lit("', 'total_transaction_amount: '"), \
-                                                    col("total_transaction_amount").cast("string"), lit("'}")))
-
-print("Printing Schema of transaction_detail_df5: ")
-transaction_detail_df5.printSchema()
-
-"""
-
-"""
-spark = (SparkSession
-         .builder \
-         .appName('Streaming-kafka-to-ClickHouse') \
-         .master('local[*]') \
-         .getOrCreate()) 
-
-source = (spark
-          .readStream \
-          .format('kafka') \
-          .option('kafka.bootstrap.servers', 'localhost:9092') \
-          .option('subscribe', 'cdc.public.orders') \
-          .load())
-
-df = (source
-          .selectExpr('CAST(key AS STRING)', 'CAST(value AS STRING)'))
-
-stream_df = df.select(col('key'), col('value'))
-
-console = (df
-            .writeStream
-            .format('console')
-            .queryName('console output')
-            .start()
-            .awaitTermination())
-
-console.show()
-"""
-
-"""
-# spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 spark-kafka.py
-
-def main():
-   spark = SparkSession.builder.appName("dataproc-kafka-read-batch-app").getOrCreate()
-
-   df = spark.read.format("kafka") \
-      .option("kafka.bootstrap.servers", "localhost:9092") \
-      .option("subscribe", "cdc.public.orders") \
-      .option("kafka.security.protocol", "SASL_SSL") \
-      .option("kafka.sasl.mechanism", "SCRAM-SHA-512") \
-      .option("startingOffsets", "earliest") \
-      .load() \
-      .selectExpr("CAST(value AS STRING)") \
-      .where(col("value").isNotNull())
-
-
-if __name__ == "__main__":
-   main()
-   
-"""
+query.awaitTermination()
